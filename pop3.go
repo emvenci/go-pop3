@@ -8,9 +8,11 @@ package pop3
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/smtp"
 	"strconv"
 	"strings"
 )
@@ -60,17 +62,23 @@ func NewClient(conn net.Conn) (*Client, error) {
 //
 // Output sent after the first line must be retrieved via readLines.
 func (c *Client) Cmd(format string, args ...interface{}) (string, error) {
+	if format != "" {
+		format += "\r\n"
+	}
 	fmt.Fprintf(c.conn, format, args...)
 	line, _, err := c.bin.ReadLine()
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	l := string(line)
-	if l[0:3] != "+OK" {
-		err = errors.New(l[5:])
+	last := l
+	if split := strings.SplitN(l, " ", 2); len(split) == 2 {
+		last = split[1]
 	}
-	if len(l) >= 4 {
-		return l[4:], err
+	if l[0] != '+' {
+		return "", errors.New(last)
 	}
-	return "", err
+	return last, nil
 }
 
 func (c *Client) ReadLines() (lines []string, err error) {
@@ -88,31 +96,52 @@ func (c *Client) ReadLines() (lines []string, err error) {
 	return
 }
 
-// User sends the given username to the server. Generally, there is no reason
-// not to use the Auth convenience method.
-func (c *Client) User(username string) (err error) {
-	_, err = c.Cmd("USER %s\r\n", username)
-	return
-}
-
-// Pass sends the given password to the server. The password is sent
-// unencrypted unless the connection is already secured by TLS (via DialTLS or
-// some other mechanism). Generally, there is no reason not to use the Auth
-// convenience method.
-func (c *Client) Pass(password string) (err error) {
-	_, err = c.Cmd("PASS %s\r\n", password)
-	return
+func (c *Client) Caps() (caps []string, err error) {
+	_, err = c.Cmd("CAPA")
+	return c.ReadLines()
 }
 
 // Auth sends the given username and password to the server, calling the User
 // and Pass methods as appropriate.
-func (c *Client) Auth(username, password string) (err error) {
-	err = c.User(username)
-	if err != nil {
-		return
+func (c *Client) Auth(username, password string) error {
+	caps, err := c.Caps()
+	var sasl []string
+	plain := false
+	for _, c := range caps {
+		if strings.HasPrefix(c, "SASL") {
+			sasl = strings.Split(c, " ")
+			sasl = sasl[1:]
+		} else if c == "PLAIN" {
+			plain = true
+		}
 	}
-	err = c.Pass(password)
-	return
+	if sasl != nil {
+		for _, v := range sasl {
+			if v == "CRAM-MD5" {
+				line, err := c.Cmd("AUTH CRAM-MD5")
+				if err != nil {
+					return err
+				}
+				chal, err := base64.StdEncoding.DecodeString(line)
+				if err != nil {
+					return err
+				}
+				cram := smtp.CRAMMD5Auth(username, password)
+				auth, err := cram.Next(chal, true)
+				if err != nil {
+					return err
+				}
+				response := base64.StdEncoding.EncodeToString(auth)
+				_, err = c.Cmd(response)
+				return err
+			}
+		}
+	}
+	if plain {
+		_, err = c.Cmd("AUTH %s %s", username, base64.StdEncoding.EncodeToString([]byte(password)))
+		return err
+	}
+	return errors.New("No supported auth methods found.")
 }
 
 // Stat retrieves a drop listing for the current maildrop, consisting of the
@@ -121,7 +150,7 @@ func (c *Client) Auth(username, password string) (err error) {
 // maildrop is ignored. In the event of an error, all returned numeric values
 // will be 0.
 func (c *Client) Stat() (count, size int, err error) {
-	l, err := c.Cmd("STAT\r\n")
+	l, err := c.Cmd("STAT")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -141,7 +170,7 @@ func (c *Client) Stat() (count, size int, err error) {
 // does not exist, or another error is encountered, the returned size will be
 // 0.
 func (c *Client) List(msg int) (size int, err error) {
-	l, err := c.Cmd("LIST %d\r\n", msg)
+	l, err := c.Cmd("LIST %d", msg)
 	if err != nil {
 		return 0, err
 	}
@@ -154,7 +183,7 @@ func (c *Client) List(msg int) (size int, err error) {
 
 // ListAll returns a list of all messages and their sizes.
 func (c *Client) ListAll() (msgs []int, sizes []int, err error) {
-	_, err = c.Cmd("LIST\r\n")
+	_, err = c.Cmd("LIST")
 	if err != nil {
 		return
 	}
@@ -184,7 +213,7 @@ func (c *Client) ListAll() (msgs []int, sizes []int, err error) {
 // Retr downloads and returns the given message. The lines are separated by LF,
 // whatever the server sent.
 func (c *Client) Retr(msg int) (text string, err error) {
-	_, err = c.Cmd("RETR %d\r\n", msg)
+	_, err = c.Cmd("RETR %d", msg)
 	if err != nil {
 		return "", err
 	}
@@ -195,26 +224,26 @@ func (c *Client) Retr(msg int) (text string, err error) {
 
 // Dele marks the given message as deleted.
 func (c *Client) Dele(msg int) (err error) {
-	_, err = c.Cmd("DELE %d\r\n", msg)
+	_, err = c.Cmd("DELE %d", msg)
 	return
 }
 
 // Noop does nothing, but will prolong the end of the connection if the server
 // has a timeout set.
 func (c *Client) Noop() (err error) {
-	_, err = c.Cmd("NOOP\r\n")
+	_, err = c.Cmd("NOOP")
 	return
 }
 
 // Rset unmarks any messages marked for deletion previously in this session.
 func (c *Client) Rset() (err error) {
-	_, err = c.Cmd("RSET\r\n")
+	_, err = c.Cmd("RSET")
 	return
 }
 
 // Quit sends the QUIT message to the POP3 server and closes the connection.
 func (c *Client) Quit() error {
-	_, err := c.Cmd("QUIT\r\n")
+	_, err := c.Cmd("QUIT")
 	if err != nil {
 		return err
 	}
