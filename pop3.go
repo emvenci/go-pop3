@@ -57,6 +57,23 @@ func NewClient(conn net.Conn) (*Client, error) {
 	return client, nil
 }
 
+// CmdAux used to send user and pass
+func (c *Client) CmdAux(format string, args ...interface{}) (string, error) {
+	fmt.Fprintf(c.conn, format, args...)
+	line, _, err := c.bin.ReadLine()
+	if err != nil {
+		return "", err
+	}
+	l := string(line)
+	if l[0:3] != "+OK" {
+		err = errors.New(l[5:])
+	}
+	if len(l) >= 4 {
+		return l[4:], err
+	}
+	return "", err
+}
+
 // Convenience function to synchronously run an arbitrary command and wait for
 // output. The terminating CRLF must be included in the format string.
 //
